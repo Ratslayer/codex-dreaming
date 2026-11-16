@@ -1,0 +1,3 @@
+interface:
+  display_name: "Review Agent KB"
+  short_description: "Review and merge KB lessons with preserved evidence"

@@ -1,0 +1,18 @@
+# Private knowledge and runtime state
+knowledge-base.md
+/projects/
+/review/
+/.aggregator/
+/.obsidian/
+
+# Local environments and generated files
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+.DS_Store

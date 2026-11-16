@@ -1,0 +1,183 @@
+<div id="agent-kb-review-live">
+  <style>
+    #agent-kb-review-live form, #agent-kb-review-live [data-groups] { display: grid; gap: calc(var(--font-size-base) * 1.2); }
+    #agent-kb-review-live .rule-row { display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: calc(var(--font-size-base) * .5); }
+    #agent-kb-review-live .pick { padding-top: calc(var(--font-size-base) * .55); }
+    #agent-kb-review-live summary { padding-block: calc(var(--font-size-base) * .55); font-weight: 500; overflow-wrap: anywhere; }
+    #agent-kb-review-live .detail-list { margin: 0 0 calc(var(--font-size-base) * 1) 0; display: grid; gap: calc(var(--font-size-base) * .3); }
+    #agent-kb-review-live .detail-list dt { font-weight: 500; margin-top: calc(var(--font-size-base) * .5); }
+    #agent-kb-review-live .detail-list dd { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+    #agent-kb-review-live .project-title { margin-bottom: calc(var(--font-size-base) * .5); }
+    #agent-kb-review-live .footer { display: grid; gap: calc(var(--font-size-base) * .5); }
+    #agent-kb-review-live [hidden] { display: none; }
+  </style>
+  <form aria-label="Review and publish selected KB rules">
+    <div data-preview class="text-small text-muted" hidden>Preview only · publication disabled</div>
+    <div data-groups></div>
+    <div class="footer">
+      <div class="viz-row">
+        <button type="submit" class="btn btn-primary" data-publish disabled>Publish selected</button>
+        <span data-count class="text-small tabular-nums" aria-live="polite">0 selected</span>
+      </div>
+      <div data-help class="text-small text-muted">Checked rules and edits will be published; checked merges replace their listed originals. Unchecked rules stay pending.</div>
+      <div data-status class="text-small" role="status" aria-live="polite"></div>
+      <div data-error class="text-small text-destructive" role="alert" hidden></div>
+    </div>
+  </form>
+</div>
+<script type="application/json" id="agent-kb-review-data">__AGENT_KB_REVIEW_DATA__</script>
+<script>
+(() => {
+  function validateData(data) {
+    if (!data || data.schema_version !== 2 || typeof data.review_id !== 'string' || typeof data.kb_root !== 'string' || !Array.isArray(data.groups)) throw new Error('Invalid review data');
+    const seen = new Set();
+    data.groups.forEach(group => {
+      if (typeof group.project !== 'string' || typeof group.proposal_id !== 'string' || !/^[a-f0-9]{64}$/.test(group.proposal_hash) || !Array.isArray(group.entries)) throw new Error('Invalid proposal snapshot');
+      group.entries.forEach(entry => {
+        if (!entry.id || seen.has(entry.id) || typeof entry.text !== 'string' || !Array.isArray(entry.lesson_ids) || !entry.lesson_versions) throw new Error('Invalid rule snapshot');
+        if (entry.requested_text !== undefined && (typeof entry.requested_text !== 'string' || !entry.requested_text.trim())) throw new Error('Invalid displayed edit');
+        if (entry.replaces !== undefined && (!Array.isArray(entry.replaces) || entry.replaces.length < 2 || new Set(entry.replaces.map(x => x.id)).size !== entry.replaces.length || entry.replaces.some(x => !x.id || x.id === entry.id || typeof x.text !== 'string' || !Array.isArray(x.lesson_ids) || !x.lesson_versions) || typeof entry.merge_conditions !== 'string' || !entry.merge_conditions.trim())) throw new Error('Invalid merge originals');
+        seen.add(entry.id);
+      });
+    });
+    return data;
+  }
+
+  function makeSubmission(data, selected, submissionId) {
+    validateData(data);
+    if (data.preview) throw new Error('Preview cannot authorize publication');
+    const allowed = new Set(data.groups.flatMap(group => group.entries.map(entry => entry.id)));
+    if (!Array.isArray(selected) || !selected.length || selected.length !== new Set(selected).size || selected.some(id => !allowed.has(id))) throw new Error('Select valid unique rule IDs');
+    if (typeof submissionId !== 'string' || !submissionId) throw new Error('Submission ID is required');
+    const selectedRows = data.groups.flatMap(group => group.entries).filter(entry => selected.includes(entry.id));
+    const replacements = selectedRows.flatMap(entry => (entry.replaces || []).map(original => original.id));
+    if (replacements.some(id => selected.includes(id)) || replacements.length !== new Set(replacements).size) throw new Error('Choose the merge or its originals, not overlapping replacements');
+    return {
+      protocol: 'agent-kb-review/v2', action: 'publish_selected_kb_rules', submission_id: submissionId,
+      authorization: 'Publish only checked rules and displayed edits. A checked merge also authorizes replacing its explicitly listed originals atomically. Preserve all other approved guidance and leave unchecked candidates pending. No second approval is needed.',
+      kb_root: data.kb_root, review_id: data.review_id,
+      choices: data.groups.map(group => ({
+        project: group.project, proposal_id: group.proposal_id, reviewed_hash: group.proposal_hash,
+        assessment_versions: group.assessment_versions || {},
+        selected_entry_ids: group.entries.filter(entry => selected.includes(entry.id)).map(entry => entry.id),
+        selected_entries: group.entries.filter(entry => selected.includes(entry.id)).map(entry => ({ id: entry.id, text: entry.text, lesson_ids: entry.lesson_ids, lesson_versions: entry.lesson_versions, ...(entry.replaces ? {replaces:entry.replaces,merge_conditions:entry.merge_conditions} : {}) })),
+        unchecked_entry_ids: group.entries.filter(entry => !selected.includes(entry.id)).map(entry => entry.id),
+        edits: Object.fromEntries(group.entries.filter(entry => selected.includes(entry.id) && entry.requested_text !== undefined && entry.requested_text !== entry.text).map(entry => [entry.id, entry.requested_text]))
+      })).filter(group => group.selected_entry_ids.length)
+    };
+  }
+
+  function makePrompt(submission) {
+    return 'Use $agent-kb-review to publish my checked rules and displayed edits. For a checked merge, atomically replace only its explicitly listed originals with the combined rule, retaining source lessons and evidence. Verify snapshots and evidence; preserve all other approved guidance. Prepare scoped drafts if needed and publish without a second approval. Leave unchecked candidates pending. If selected wording, originals, or evidence materially changed, show a refreshed checklist. Read back the result.\n\n' + JSON.stringify(submission, null, 2);
+  }
+
+  if (typeof document === 'undefined') {
+    if (typeof module !== 'undefined') module.exports = { validateData, makeSubmission, makePrompt };
+    return;
+  }
+  const root = document.getElementById('agent-kb-review-live');
+  const data = validateData(JSON.parse(document.getElementById('agent-kb-review-data').textContent));
+  const form = root.querySelector('form'), groups = root.querySelector('[data-groups]');
+  const button = root.querySelector('[data-publish]'), count = root.querySelector('[data-count]');
+  const status = root.querySelector('[data-status]'), error = root.querySelector('[data-error]');
+  const boxes = [], folds = [];
+  let busy = false, sent = false, pendingSubmission = null;
+  const element = (tag, text, className) => {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    if (className) node.className = className;
+    return node;
+  };
+  function field(list, title, text) {
+    if (!text) return;
+    list.append(element('dt', title), element('dd', text));
+  }
+  data.groups.forEach(group => {
+    const section = element('section');
+    section.append(element('h3', group.project, 'project-title'));
+    group.entries.forEach(entry => {
+      const row = element('div', undefined, 'rule-row');
+      const pick = element('div', undefined, 'pick'), label = element('label', undefined, 'form-check');
+      const box = element('input'); box.type = 'checkbox'; box.className = 'form-check-input'; box.value = entry.id;
+      label.append(box, element('span', 'Select: ' + (entry.title || entry.text), 'sr-only')); pick.append(label);
+      const details = element('details'); details.dataset.entryId = entry.id;
+      const summary = element('summary', (entry.replaces ? 'Merge · ' : '') + (entry.title || entry.text), 'cursor-interaction');
+      const list = element('dl', undefined, 'detail-list');
+      field(list, entry.requested_text ? 'Proposed wording · displayed edit' : 'Proposed wording', entry.requested_text || entry.text);
+      if (entry.requested_text && entry.requested_text !== entry.text) field(list, 'Original wording', entry.text);
+      if (entry.replaces) {
+        field(list, 'Replaces ' + entry.replaces.length + ' entries', entry.replaces.map((original, index) => (index + 1) + '. ' + original.text).join('\n\n'));
+        field(list, 'Compatible conditions and preserved exceptions', entry.merge_conditions);
+      }
+      field(list, 'Applies when', entry.applicability);
+      field(list, 'Why this was suggested', entry.rationale);
+      (entry.evidence || []).forEach(source => {
+        field(list, 'Evidence', source.quote);
+        field(list, 'Source', source.label || source.source_label || source.session_id);
+        if (source.source_path) {
+          const sourceRow = element('dd'), sourceButton = element('button', 'View source', 'btn btn-ghost');
+          sourceButton.type = 'button';
+          sourceButton.addEventListener('click', async () => {
+            if (typeof window.openai?.sendFollowUpMessage !== 'function') { status.textContent = 'Source: ' + source.source_path; return; }
+            try { await window.openai.sendFollowUpMessage({ title: 'View supporting source', prompt: 'Show this preserved KB evidence read-only. This is not a publication request.\n\n' + JSON.stringify({ action: 'view_kb_source', source_path: source.source_path }) }); }
+            catch (failure) { status.textContent = 'Could not confirm the source request. Source: ' + source.source_path; }
+          });
+          sourceRow.append(sourceButton); list.append(sourceRow);
+        }
+      });
+      field(list, 'Review note', entry.review_note);
+      details.append(summary, list); row.append(pick, details); section.append(row);
+      boxes.push(box); folds.push(details);
+      box.addEventListener('change', () => { sent = false; pendingSubmission = null; status.textContent = ''; error.hidden = true; update(); persist(); });
+      summary.addEventListener('click', () => setTimeout(persist, 0));
+    });
+    groups.append(section);
+  });
+  if (data.preview) {
+    root.querySelector('[data-preview]').hidden = false;
+    root.querySelector('[data-help]').textContent = 'Preview only. No message will be sent and no knowledge will be published.';
+  }
+  const selected = () => boxes.filter(box => box.checked).map(box => box.value);
+  function update() {
+    boxes.forEach(box => { box.disabled = busy; });
+    count.textContent = selected().length + ' of ' + boxes.length + ' selected';
+    button.disabled = busy || sent || !selected().length;
+    button.textContent = busy ? 'Submitting…' : sent ? 'Submitted for publication' : data.preview ? 'Preview selection' : 'Publish selected';
+  }
+  function persist() {
+    if (typeof window.openai?.setWidgetState !== 'function') return;
+    try { Promise.resolve(window.openai.setWidgetState({
+      modelContent: { protocol: 'agent-kb-review/v2', intent: 'selection_preview_only', review_id: data.review_id, selected_entry_ids: selected() },
+      privateContent: { review_id: data.review_id, expanded: folds.filter(fold => fold.open).map(fold => fold.dataset.entryId), pending_submission: pendingSubmission }
+    })).catch(() => {}); } catch (failure) { /* Optional state persistence. */ }
+  }
+  function restore(state) {
+    if (state?.modelContent?.review_id !== data.review_id) return;
+    const ids = state.modelContent.selected_entry_ids || [];
+    boxes.forEach(box => { box.checked = ids.includes(box.value); });
+    const saved = state.privateContent?.review_id === data.review_id ? state.privateContent : {};
+    folds.forEach(fold => { fold.open = (saved.expanded || []).includes(fold.dataset.entryId); });
+    pendingSubmission = saved.pending_submission || null;
+    update();
+  }
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (busy || sent || !selected().length) return;
+    if (data.preview) { status.textContent = 'Preview: ' + selected().length + ' selected; nothing published.'; return; }
+    if (typeof window.openai?.sendFollowUpMessage !== 'function') { error.textContent = 'The chat connection is unavailable. Nothing was submitted.'; error.hidden = false; return; }
+    pendingSubmission = pendingSubmission || (typeof globalThis.crypto?.randomUUID === 'function' ? globalThis.crypto.randomUUID() : 'submission-' + Date.now() + '-' + Math.random().toString(36).slice(2));
+    let submission;
+    try { submission = makeSubmission(data, selected(), pendingSubmission); }
+    catch (failure) { error.textContent = failure.message; error.hidden = false; return; }
+    busy = true; error.hidden = true; update(); persist();
+    try {
+      await window.openai.sendFollowUpMessage({ title: 'Publish ' + selected().length + ' selected KB rules', prompt: makePrompt(submission) });
+      sent = true; status.textContent = 'Publication requested. The chat will verify and report the result.';
+    } catch (failure) { error.textContent = 'Could not confirm submission. Check the chat before retrying; your selections are preserved.'; error.hidden = false; }
+    finally { busy = false; update(); }
+  });
+  restore(window.openai?.widgetState);
+  window.addEventListener('openai:set_globals', event => { if (event.detail?.globals?.widgetState && !busy) restore(event.detail.globals.widgetState); });
+  update();
+})();
+</script>
